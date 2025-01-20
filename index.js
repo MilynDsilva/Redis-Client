@@ -23,24 +23,83 @@ class RedisManager {
      * @param {Object} data - The data to associate with the key.
      * @returns {Promise<void>}
      */
-    async addOrUpdateNoExpiry(table, key, data) {
+    async addOrUpdateTableWithNoTableExpiry(table, key, data) {
         const jsonData = JSON.stringify(data);
         await this.redis.hset(table, key, jsonData);
     }
 
     /**
-     * Adds or updates data in a specific table with a TTL.
+     * Adds or updates data in a specific table with a TTL for the entire table.
      * @param {string} table - The table name (e.g., "users", "orders").
      * @param {string} key - The unique key.
      * @param {Object} data - The data to associate with the key.
      * @param {number} ttl - The time-to-live for the table in seconds.
      * @returns {Promise<void>}
      */
-    async addOrUpdateWithExpiry(table, key, data, ttl) {
+    async addOrUpdateTableWithTableExpiry(table, key, data, ttl) {
         const jsonData = JSON.stringify(data);
         await this.redis.hset(table, key, jsonData);
         await this.redis.expire(table, ttl);
     }
+
+    /**
+     * Adds or updates a key-value pair in Redis with a TTL.
+     * The key is dynamically created as "table-key" within this method.
+     * @param {string} table - The table name (e.g., "orders", "users").
+     * @param {string} key - The unique key within the table (e.g., "alex").
+     * @param {string|Object} value - The value to store. If it's an object, it will be stringified.
+     * @param {number} ttl - The time-to-live for the key in seconds.
+     * @returns {Promise<void>}
+     */
+    async addOrUpdateCompositeKeyPatternWithExpiry(table, key, value, ttl) {
+        const compositeKey = `${table}-${key}`;
+        const data = typeof value === "object" ? JSON.stringify(value) : value;
+        /* Use SET with EX option to store the value and set expiry in one call */
+        await this.redis.set(compositeKey, data, "EX", ttl);
+    }
+
+    /**
+     * Adds or updates a key-value pair in Redis without a TTL.
+     * The key is dynamically created as "table-key" within this method.
+     * @param {string} table - The table name (e.g., "orders", "users").
+     * @param {string} key - The unique key within the table (e.g., "alex").
+     * @param {string|Object} value - The value to store. If it's an object, it will be stringified.
+     * @returns {Promise<void>}
+     */
+    async addOrUpdateCompositeKeyPatternNoExpiry(table, key, value) {
+        const compositeKey = `${table}-${key}`;
+        const data = typeof value === "object" ? JSON.stringify(value) : value;
+        await this.redis.set(compositeKey, data);
+    }
+
+    /**
+     * Fetches data for keys matching a simple `tablename-key` pattern in Redis.
+     * @param {string} table - The table name (e.g., "users").
+     * @param {string} pattern - The pattern to match keys (e.g., `key123` for `users-key123`).
+     * @returns {Promise<Object>} An object where keys are the matched keys and values are their data.
+     */
+    async getAllMatchingDataByPattern(table, pattern) {
+        const matchPattern = `${table}-${pattern}*`; /* Construct the pattern for SCAN */
+        let cursor = "0";
+        const result = {};
+
+        do {
+            /* Scan for keys matching the pattern */
+            const [nextCursor, keys] = await this.redis.scan(cursor, "MATCH", matchPattern, "COUNT", 100);
+            cursor = nextCursor;
+
+            for (const key of keys) {
+                const data = await this.redis.get(key);
+                if (data) {
+                    const field = key.replace(`${table}-`, ""); /* Remove table prefix from key */
+                    result[field] = JSON.parse(data); /* Parse JSON value */
+                }
+            }
+        } while (cursor !== "0");
+
+        return result;
+    }
+
 
     /**
      * Fetches data for a specific key in a table.
@@ -48,17 +107,29 @@ class RedisManager {
      * @param {string} key - The unique key.
      * @returns {Promise<Object|null>} The data associated with the key, or null if not found.
      */
-    async getByKey(table, key) {
+    async getByTableAndKey(table, key) {
         const data = await this.redis.hget(table, key);
         return data ? JSON.parse(data) : null;
     }
 
     /**
-     * Fetches all data in a table.
-     * @param {string} table - The table name.
-     * @returns {Promise<Object>} An object where keys are the keys and values are their data.
+     * Fetches data for a specific key in a table using the `table:key` format.
+     * @param {string} table - The table name (e.g., "users").
+     * @param {string} key - The unique key within the table.
+     * @returns {Promise<Object|null>} The data associated with the key, or null if not found.
      */
-    async getAll(table) {
+    async getByTableAndKeyPattern(table, key) {
+        const compositeKey = `${table}:${key}`; /* Use the same composite key format */
+        const data = await this.redis.get(compositeKey); /* Use GET to retrieve the value */
+        return data ? JSON.parse(data) : null; /* Parse the JSON data if found */
+    }
+
+    /**
+  * Fetches all data from a table.
+  * @param {string} table - The table name.
+  * @returns {Promise<Object>} An object where keys are the keys and values are their data.
+  */
+    async getAllFromTable(table) {
         const rawData = await this.redis.hgetall(table);
         const parsedData = {};
         for (const [key, value] of Object.entries(rawData)) {
@@ -73,8 +144,19 @@ class RedisManager {
      * @param {string} key - The unique key.
      * @returns {Promise<number>} The number of fields removed.
      */
-    async deleteByKey(table, key) {
+    async deleteDataByTableAndKey(table, key) {
         return await this.redis.hdel(table, key);
+    }
+
+    /**
+     * Deletes a key-value pair from Redis where the key is a composite key (e.g., "table-key").
+     * @param {string} table - The table name (e.g., "users", "orders").
+     * @param {string} key - The unique key within the table (e.g., "123", "alex").
+     * @returns {Promise<number>} The number of keys removed (1 if successful, 0 if not found).
+     */
+    async deleteCompositeKeyByTableKeyPattern(table, key) {
+        const compositeKey = `${table}-${key}`;
+        return await this.redis.del(compositeKey);
     }
 
     /**
@@ -82,7 +164,7 @@ class RedisManager {
      * @param {string} table - The table name.
      * @returns {Promise<void>}
      */
-    async deleteAll(table) {
+    async deleteAllFromTable(table) {
         await this.redis.del(table);
     }
 
@@ -92,7 +174,7 @@ class RedisManager {
      * @param {number} ttl - The time-to-live in seconds.
      * @returns {Promise<void>}
      */
-    async setExpiry(table, ttl) {
+    async setTableExpiry(table, ttl) {
         await this.redis.expire(table, ttl);
     }
 
@@ -101,7 +183,7 @@ class RedisManager {
      * @param {string} table - The table name.
      * @returns {Promise<void>}
      */
-    async removeExpiry(table) {
+    async removeTableExpiry(table) {
         await this.redis.persist(table);
     }
 
